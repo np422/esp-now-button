@@ -39,6 +39,29 @@ const uint64_t debounce_delay = 100 * 1000;
 
 uint8_t read_mac[ESP_NOW_ETH_ALEN];
 
+static void send_reg_msg() {
+    esp_now_message_t msg;
+    const TickType_t delay = 100 / portTICK_PERIOD_MS;
+    // setup register message
+    register_message_t *my_reg_msg;
+    my_reg_msg = (register_message_t *) msg.message;
+    my_reg_msg->type = RELAY;
+    strcpy((char *) my_reg_msg->tag, TAG);
+    memcpy((void *) my_reg_msg->mac, my_mac, ESP_NOW_ETH_ALEN);
+
+    // setup esp_now_message to send
+    msg.len = sizeof(register_message_t);
+    msg.type=REGISTER;
+
+    ESP_LOGI(PROG,"Sending message of type %u and size %u to gw", msg.type, msg.len);
+    esp_now_send(gw_mac, (const uint8_t *) &msg, sizeof(esp_now_message_t));
+    vTaskDelay(delay);
+}
+
+static void periodic_timer_callback(void* arg) {
+    send_reg_msg();
+}
+
 static void my_espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS ) {
         ESP_LOGI(PROG, "ESP_NOW_SEND callback, status SUCCESS ");
@@ -67,7 +90,7 @@ static void my_espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int 
 }
 
 static void esp_init(void) {
-    esp_now_message_t *msg;
+
     const TickType_t delay = 10000 / portTICK_PERIOD_MS;
 
     esp_now_init();
@@ -82,19 +105,10 @@ static void esp_init(void) {
     peer->encrypt = false;
     memcpy(peer->peer_addr, gw_mac, ESP_NOW_ETH_ALEN);
     ESP_ERROR_CHECK(esp_now_add_peer(peer));
-
-    msg = malloc((size_t) sizeof(esp_now_message_t));
-    msg->type=REGISTER;
-    register_message_t my_reg_msg;
-    my_reg_msg.type = BUTTON;
-    strcpy((char *) my_reg_msg.tag, TAG);
-    memcpy((void *) my_reg_msg.mac, my_mac, ESP_NOW_ETH_ALEN);
-    msg->len=sizeof(register_message_t);
-    memcpy(msg->message, &my_reg_msg, msg->len);
-    ESP_LOGI(PROG,"Sending message of type %u and size %u to gw", msg->type, msg->len);
-    esp_now_send(gw_mac, (const uint8_t *) msg, sizeof(esp_now_message_t));
-    vTaskDelay(delay);
     free(peer);
+    vTaskDelay(delay);
+    send_reg_msg();
+
 }
 
 
@@ -146,6 +160,18 @@ void gpio_init() {
     gpio_isr_handler_add(GPIO_BUTTON, gpio_isr_handler, (void*) NULL);
 }
 
+void timer_init() {
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &periodic_timer_callback,
+        /* name is optional, but may help identify the timer when debugging */
+        .name = "periodic"
+    };
+    esp_timer_handle_t periodic_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+    // Run once every minute
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 60 * 1000 * 1000));
+}
+
 void app_main(void)
 {
 
@@ -170,5 +196,6 @@ void app_main(void)
     button_queue =xQueueCreate(10, sizeof(uint8_t));
     esp_init();
     gpio_init();
+    timer_init();
     xTaskCreate(send_task, "esp_now_send_task", 64*1024, NULL, 1, NULL);
 }
