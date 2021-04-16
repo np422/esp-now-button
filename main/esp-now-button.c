@@ -23,21 +23,31 @@
 #include "../../esp-now-gw/main/esp_msg_types.h"
 
 #define QUEUE_SIZE     20
-#define GPIO_BUTTON    13
-#define GPIO_BUTTON_SEL (1ULL<<GPIO_BUTTON)
 #define ESP_INTR_FLAG_DEFAULT 0
 
-const uint8_t my_mac[ESP_NOW_ETH_ALEN] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00 };
+const uint8_t my_mac[ESP_NOW_ETH_ALEN] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
 const uint8_t gw_mac[ESP_NOW_ETH_ALEN] = { 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x00 };
+const uint8_t gpio_buttons[MAX_BUTTONS] = { 27, 0, 0, 0, 0, 0, 0, 0};
+int64_t last_button_press[MAX_BUTTONS] = { 0, 0, 0, 0, 0, 0, 0, 0};
+
+#define TAG "button-01"
+#define NOTFOUND 200
+
 const char* PROG = "button";
 static xQueueHandle button_queue;
-int64_t last_button_press = 0;
+
 // esp_timer_get_time returns usec, not millis
-const uint64_t debounce_delay = 100 * 1000;
-
-#define TAG "button-00"
-
+const uint64_t debounce_delay = 500 * 1000;
 uint8_t read_mac[ESP_NOW_ETH_ALEN];
+
+uint8_t gpio_to_button_num(uint32_t gpio_num) {
+    for (uint8_t i = 0 ; i<MAX_BUTTONS ; i++ ) {
+        if (gpio_num == gpio_buttons[i])
+            return i;
+    }
+    return NOTFOUND;
+}
+
 
 static void send_reg_msg() {
     esp_now_message_t msg;
@@ -45,7 +55,8 @@ static void send_reg_msg() {
     // setup register message
     register_message_t *my_reg_msg;
     my_reg_msg = (register_message_t *) msg.message;
-    my_reg_msg->type = RELAY;
+    my_reg_msg->type = BUTTON;
+    strcpy((char *) msg.dest_tag, "gw");
     strcpy((char *) my_reg_msg->tag, TAG);
     memcpy((void *) my_reg_msg->mac, my_mac, ESP_NOW_ETH_ALEN);
 
@@ -112,14 +123,15 @@ static void esp_init(void) {
 }
 
 
+
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
-    static uint8_t u = 1;
-
+    uint32_t button_number = (uint32_t) arg;
+    //uint8_t button_number = gpio_to_button_num(gpio_num);
     uint64_t now = esp_timer_get_time();
-    if ( now - last_button_press > debounce_delay) {
-        xQueueSendFromISR(button_queue, &u , NULL);
-        last_button_press = now;
+    if ( now - last_button_press[button_number] > debounce_delay) {
+        xQueueSendFromISR(button_queue, &button_number , NULL);
+        last_button_press[button_number] = now;
     }
 }
 
@@ -130,19 +142,31 @@ static void send_task(void *foo) {
     uint8_t asdf;
     ESP_LOGI(PROG, "Pulling");
     for(;;) {
-        if (xQueueReceive( button_queue, &(asdf), 10000 / portTICK_PERIOD_MS) == pdPASS) {
+        if (xQueueReceive( button_queue, &(asdf), 60000 / portTICK_PERIOD_MS) == pdPASS) {
             ESP_LOGI(PROG, "Pulled message");
+            ESP_LOGI(PROG, "Button number %i pressed", asdf);
+            // Setup esp_now_message_t
             smsg.len = sizeof(button_press_message_t);
             smsg.type = BUTTON_PRESSED;
+            strcpy((char *) smsg.dest_tag, "gw");
             strcpy((char *) bmsg.sender_tag, TAG);
+
             bmsg.buttons_pressed[0] = 1;
-            for (int i=1 ; i < MAX_BUTTONS ; i++) {
-                bmsg.buttons_pressed[i] = 0;
+            for (uint8_t i=0 ; i < MAX_BUTTONS ; i++) {
+                if (i==asdf) {
+                    bmsg.buttons_pressed[i] = 1;
+                } else {
+                    bmsg.buttons_pressed[i] = 0;
+                }
+            }
+            ESP_LOGI(PROG, "Buttons in message dump:");
+            for (uint8_t i=0 ; i < MAX_BUTTONS ; i++) {
+                ESP_LOGI(PROG,"Pos = %i, value = %i", i, bmsg.buttons_pressed[i] );
             }
             memcpy(smsg.message, &bmsg, sizeof(button_press_message_t));
             esp_now_send(gw_mac, (const uint8_t *) &smsg, sizeof(esp_now_message_t));
         } else {
-            ESP_LOGI(PROG, "Failed to pul message");
+            ESP_LOGI(PROG, "Failed to pull message withing a minute");
         }
     }
 }
@@ -150,14 +174,19 @@ static void send_task(void *foo) {
 void gpio_init() {
     gpio_config_t io_conf;
 
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;
-    io_conf.pin_bit_mask = GPIO_BUTTON_SEL;
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = 1;
-    io_conf.pull_down_en = 0;
-    gpio_config(&io_conf);
-    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-    gpio_isr_handler_add(GPIO_BUTTON, gpio_isr_handler, (void*) NULL);
+    for (uint8_t i = 0; i< MAX_BUTTONS ; i++) {
+        if ( gpio_buttons[i] != 0 ) {
+            io_conf.intr_type = GPIO_INTR_NEGEDGE;
+            io_conf.pin_bit_mask = (1ULL<<gpio_buttons[i]);
+            io_conf.mode = GPIO_MODE_INPUT;
+            io_conf.pull_up_en = 1;
+            io_conf.pull_down_en = 0;
+            gpio_config(&io_conf);
+            gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+            ESP_LOGI(PROG, "Installing ISR for button no %i", gpio_buttons[i]);
+            gpio_isr_handler_add(gpio_buttons[i], gpio_isr_handler, (void*) i);
+        }
+    }
 }
 
 void timer_init() {
@@ -180,6 +209,7 @@ void app_main(void)
         ESP_ERROR_CHECK( nvs_flash_erase() );
         ret = nvs_flash_init();
     }
+
     ESP_ERROR_CHECK( ret );
     ESP_ERROR_CHECK(esp_base_mac_addr_set(my_mac));
     esp_netif_create_default_wifi_sta();

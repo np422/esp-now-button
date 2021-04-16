@@ -1,6 +1,6 @@
 # Remove build directory from git repo
 
-build/**
+build**
 
 # Prerequisites
 *.d
